@@ -10,3 +10,9 @@ html, body {
   background: #FAFAF8;
   color: #1C1C1A;
 }
+
+@layer components {
+  .input {
+    @apply w-full rounded border border-steel-100 bg-white px-3 py-2 text-sm focus:border-ink focus:outline-none;
+  }
+}

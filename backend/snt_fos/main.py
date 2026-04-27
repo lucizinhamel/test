@@ -11,13 +11,38 @@ from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from .db import get_session
-from .models import Document, DocumentLink, Entity, TaxObligation
+from .ledger import (
+    LedgerError,
+    PostingInput,
+    TransactionInput,
+    create_draft,
+    post_transaction,
+    trial_balance as compute_trial_balance,
+    void_transaction,
+)
+from .models import (
+    Account,
+    Counterparty,
+    Document,
+    DocumentLink,
+    Entity,
+    LedgerTransaction,
+    Posting,
+    TaxObligation,
+)
 from .schemas import (
+    AccountOut,
+    CounterpartyIn,
+    CounterpartyOut,
     DocumentLinkIn,
     DocumentLinkOut,
     DocumentOut,
     EntityOut,
+    PostingOut,
     TaxObligationOut,
+    TransactionIn,
+    TransactionOut,
+    TrialBalanceRow,
 )
 from .seed.bootstrap import bootstrap
 from .storage import open_for_read, store_stream
@@ -182,3 +207,177 @@ def list_links(
     if target_id:
         q = q.filter(DocumentLink.target_id == target_id)
     return q.order_by(DocumentLink.created_at.desc()).all()
+
+
+# --- Accounts ----------------------------------------------------------------
+
+
+@app.get("/api/accounts", response_model=list[AccountOut])
+def list_accounts(
+    entity_id: Optional[str] = None,
+    group_code: Optional[str] = None,
+    db: Session = Depends(get_session),
+) -> list[Account]:
+    q = db.query(Account).filter(Account.active == True)  # noqa: E712
+    if entity_id:
+        q = q.filter(Account.entity_id == entity_id)
+    if group_code:
+        q = q.filter(Account.group_code == group_code)
+    return q.order_by(Account.entity_id, Account.sort_order, Account.code).all()
+
+
+@app.get("/api/trial-balance", response_model=list[TrialBalanceRow])
+def trial_balance(
+    entity_id: str,
+    as_of: Optional[date] = None,
+    db: Session = Depends(get_session),
+) -> list[dict]:
+    return compute_trial_balance(db, entity_id, as_of=as_of)
+
+
+# --- Counterparties ----------------------------------------------------------
+
+
+@app.get("/api/counterparties", response_model=list[CounterpartyOut])
+def list_counterparties(
+    is_client: Optional[bool] = None,
+    is_supplier: Optional[bool] = None,
+    db: Session = Depends(get_session),
+) -> list[Counterparty]:
+    q = db.query(Counterparty).filter(Counterparty.active == True)  # noqa: E712
+    if is_client is not None:
+        q = q.filter(Counterparty.is_client == is_client)
+    if is_supplier is not None:
+        q = q.filter(Counterparty.is_supplier == is_supplier)
+    return q.order_by(Counterparty.name).all()
+
+
+@app.post("/api/counterparties", response_model=CounterpartyOut)
+def create_counterparty(payload: CounterpartyIn, db: Session = Depends(get_session)) -> Counterparty:
+    cp = Counterparty(**payload.model_dump())
+    db.add(cp)
+    db.commit()
+    db.refresh(cp)
+    return cp
+
+
+@app.patch("/api/counterparties/{cp_id}", response_model=CounterpartyOut)
+def update_counterparty(
+    cp_id: str, payload: CounterpartyIn, db: Session = Depends(get_session)
+) -> Counterparty:
+    cp = db.get(Counterparty, cp_id)
+    if cp is None:
+        raise HTTPException(404, "not found")
+    for k, v in payload.model_dump().items():
+        setattr(cp, k, v)
+    db.commit()
+    db.refresh(cp)
+    return cp
+
+
+# --- Ledger transactions -----------------------------------------------------
+
+
+def _serialize_transaction(tx: LedgerTransaction, db: Session) -> TransactionOut:
+    # Pre-fetch account codes once
+    account_ids = [p.account_id for p in tx.postings]
+    accs = {a.id: a for a in db.query(Account).filter(Account.id.in_(account_ids)).all()} if account_ids else {}
+    out = TransactionOut.model_validate(tx)
+    ent = db.get(Entity, tx.entity_id)
+    out.entity_code = ent.code if ent else None
+    out.counterparty_name = tx.counterparty.name if tx.counterparty else None
+    out.postings = []
+    total = Decimal("0")
+    for p in tx.postings:
+        po = PostingOut.model_validate(p)
+        a = accs.get(p.account_id)
+        po.account_code = a.code if a else None
+        po.account_name_es = a.name_es if a else None
+        out.postings.append(po)
+        total += p.debit
+    out.total = total
+    return out
+
+
+@app.get("/api/transactions", response_model=list[TransactionOut])
+def list_transactions(
+    entity_id: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = 100,
+    db: Session = Depends(get_session),
+) -> list[TransactionOut]:
+    q = db.query(LedgerTransaction)
+    if entity_id:
+        q = q.filter(LedgerTransaction.entity_id == entity_id)
+    if status:
+        q = q.filter(LedgerTransaction.status == status)
+    q = q.order_by(LedgerTransaction.txn_date.desc(), LedgerTransaction.created_at.desc()).limit(limit)
+    return [_serialize_transaction(tx, db) for tx in q.all()]
+
+
+@app.get("/api/transactions/{tx_id}", response_model=TransactionOut)
+def get_transaction(tx_id: str, db: Session = Depends(get_session)) -> TransactionOut:
+    tx = db.get(LedgerTransaction, tx_id)
+    if tx is None:
+        raise HTTPException(404, "not found")
+    return _serialize_transaction(tx, db)
+
+
+@app.post("/api/transactions", response_model=TransactionOut)
+def create_transaction(payload: TransactionIn, db: Session = Depends(get_session)) -> TransactionOut:
+    try:
+        tx = create_draft(
+            db,
+            TransactionInput(
+                entity_id=payload.entity_id,
+                txn_date=payload.txn_date,
+                description=payload.description,
+                postings=[
+                    PostingInput(
+                        account_code=p.account_code,
+                        debit=p.debit,
+                        credit=p.credit,
+                        description=p.description,
+                        iva_code=p.iva_code,
+                        iva_rate=p.iva_rate,
+                        iva_amount=p.iva_amount,
+                        retention_code=p.retention_code,
+                        retention_amount=p.retention_amount,
+                    )
+                    for p in payload.postings
+                ],
+                currency=payload.currency,
+                fx_rate_to_base=payload.fx_rate_to_base,
+                counterparty_id=payload.counterparty_id,
+                reference_type=payload.reference_type,
+                reference_id=payload.reference_id,
+                project_tag=payload.project_tag,
+                brand_tag=payload.brand_tag,
+                value_date=payload.value_date,
+            ),
+        )
+    except LedgerError as e:
+        raise HTTPException(400, str(e))
+    return _serialize_transaction(tx, db)
+
+
+@app.post("/api/transactions/{tx_id}/post", response_model=TransactionOut)
+def post_tx(tx_id: str, db: Session = Depends(get_session)) -> TransactionOut:
+    try:
+        tx = post_transaction(db, tx_id)
+    except LedgerError as e:
+        raise HTTPException(400, str(e))
+    return _serialize_transaction(tx, db)
+
+
+@app.post("/api/transactions/{tx_id}/void", response_model=TransactionOut)
+def void_tx(tx_id: str, db: Session = Depends(get_session)) -> TransactionOut:
+    try:
+        tx = void_transaction(db, tx_id)
+    except LedgerError as e:
+        raise HTTPException(400, str(e))
+    return _serialize_transaction(tx, db)
+
+
+# Ensure Decimal import is in scope for _serialize_transaction
+from decimal import Decimal  # noqa: E402

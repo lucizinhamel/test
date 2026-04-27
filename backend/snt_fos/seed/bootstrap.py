@@ -10,7 +10,8 @@ from decimal import Decimal
 from sqlalchemy.orm import Session
 
 from ..db import Base, SessionLocal, engine
-from ..models import Entity, TaxObligation
+from ..models import Account, Entity, TaxObligation
+from .spanish_pgc import coa_for_personal, pgc_for_sl
 from .spanish_tax_calendar import calendar_for_personal, calendar_for_sl
 
 # Initial entity set. Subsidiaries marked inactive=False until the founder
@@ -105,13 +106,29 @@ def _seed_obligations_for(db: Session, entity: Entity, year: int) -> int:
     return inserted
 
 
+def _seed_accounts_for(db: Session, entity: Entity) -> int:
+    rows = coa_for_personal() if entity.is_personal else pgc_for_sl()
+    inserted = 0
+    for r in rows:
+        exists = (
+            db.query(Account).filter_by(entity_id=entity.id, code=r["code"]).one_or_none()
+        )
+        if exists:
+            continue
+        db.add(Account(entity_id=entity.id, **r))
+        inserted += 1
+    db.commit()
+    return inserted
+
+
 def bootstrap() -> dict:
-    """Create tables, seed entities, and populate tax calendar. Idempotent."""
+    """Create tables, seed entities, chart of accounts, and tax calendar. Idempotent."""
     Base.metadata.create_all(bind=engine)
-    summary = {"entities": [], "obligations_inserted": 0}
+    summary = {"entities": [], "obligations_inserted": 0, "accounts_inserted": 0}
     with SessionLocal() as db:
         entities = _ensure_entities(db)
         for code, ent in entities.items():
+            summary["accounts_inserted"] += _seed_accounts_for(db, ent)
             for year in SEED_YEARS:
                 n = _seed_obligations_for(db, ent, year)
                 summary["obligations_inserted"] += n

@@ -2,7 +2,11 @@
 
 Local-first, multi-entity financial OS for SNT Holdings.
 
-> **Slice 1.** Spanish tax calendar (full Modelo coverage with dates, rates, reserve guidance, legal basis) + content-addressable document vault. The double-entry ledger, invoicing, and reconciliation arrive in the next slices.
+> **Slices delivered**
+> - **1.** Spanish tax calendar (full Modelo coverage with dates, rates, reserve guidance, legal basis) + content-addressable document vault.
+> - **2.** Spanish PGC chart of accounts + double-entry ledger with balance invariant + counterparties + trial balance.
+>
+> Invoicing, reconciliation, encryption & auth come in the next slices.
 
 ## What's in here
 
@@ -49,6 +53,9 @@ talks to one origin.
 ## Pages
 
 - **Dashboard** (`/`) — next 90 days of tax obligations with countdown, modelo, period, reserve %.
+- **Journal** (`/transactions`) — list of all ledger transactions, filter by entity & status. New entry form with live "balanced?" indicator. Detail view shows all postings; posted entries are immutable.
+- **Accounts** (`/accounts`) — chart of accounts per entity, grouped by PGC group (1–7), with debits/credits/natural-balance per account. Trial-balance check at top.
+- **Counterparties** (`/counterparties`) — clients & suppliers with NIF/VAT, default IVA treatment (general / reduced / intracomunitario / exportación / exempt).
 - **Tax Calendar** (`/tax`) — full table grouped by entity, with rates, thresholds, legal basis (LIVA/LIRPF/LIS/RGAT articles), and notes.
 - **Documents** (`/documents`) — drag-and-drop upload, dedup by SHA-256, list & download. Files live at `~/.snt-fos/documents/<sha[0:2]>/<sha[2:4]>/<sha>`.
 
@@ -104,8 +111,23 @@ has: `due_date` (auto-shifted off Sat/Sun per art. 30.5 Ley 39/2015),
 ```
 GET    /api/health
 GET    /api/entities
+
 GET    /api/tax-calendar?entity_id=&modelo=&status=&upcoming_days=&include_past_days=
 PATCH  /api/tax-calendar/{id}/status        form: status=upcoming|in_prep|filed|paid|na
+
+GET    /api/accounts?entity_id=&group_code=
+GET    /api/trial-balance?entity_id=&as_of=
+
+GET    /api/counterparties?is_client=&is_supplier=
+POST   /api/counterparties                  json: name, tax_id?, country?, default_iva_treatment, ...
+PATCH  /api/counterparties/{id}
+
+GET    /api/transactions?entity_id=&status=&limit=
+GET    /api/transactions/{id}
+POST   /api/transactions                    json: entity_id, txn_date, description, postings[…]
+POST   /api/transactions/{id}/post          enforces balance invariant; sets status=posted
+POST   /api/transactions/{id}/void          drafts only
+
 POST   /api/documents                       multipart: file, title?, notes?
 GET    /api/documents
 GET    /api/documents/{id}/download
@@ -113,12 +135,21 @@ POST   /api/documents/{id}/links            json: target_type, target_id, role?,
 GET    /api/documents/links?target_type=&target_id=
 ```
 
+## Ledger invariants (enforced)
+
+- Sum of debits = sum of credits per transaction (in base currency, to the cent)
+- Each posting is one-sided (debit XOR credit)
+- Posted transactions are immutable — corrections require a new entry
+- Accounts marked `is_postable=false` cannot receive postings
+- Trial-balance test (`backend/tests/test_ledger.py::test_trial_balance_balances`) confirms global D=C across the whole ledger after every change
+
 ## Not yet built (next slices)
 
 - Encrypted DB (SQLCipher passphrase) — currently plain SQLite
-- Double-entry ledger + Spanish PGC chart of accounts
-- Invoice issuance (RD 1619/2012 + Verifactu hash chain & QR — RD 1007/2023)
-- Bank CSV import + reconciliation
-- Counterparty master + 347/349 aggregation from real ledger data
-- Authentication (single-user app password)
+- Invoice issuance (RD 1619/2012 + Verifactu hash chain & QR — RD 1007/2023, decision pending)
+- Bank CSV import + reconciliation (BBVA / Santander / Revolut)
+- 347 / 349 aggregation from real ledger data
+- Authentication (single-user app password + idle lock)
 - Backup/restore
+- P&L and Balance Sheet reports
+- Multi-currency FX gain/loss postings
